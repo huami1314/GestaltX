@@ -82,6 +82,15 @@ actor CustomizationStore {
         let temporary = fm.temporaryDirectory.appendingPathComponent("GX-Wallpaper-\(UUID().uuidString)")
         defer { try? fm.removeItem(at: temporary) }
         try CustomizationArchive.extract(source, into: temporary)
+        return try importDescriptors(in: temporary, name: source.deletingPathExtension().lastPathComponent, id: id)
+    }
+    /// Imports descriptor folders GestaltX generated itself (for example video wallpapers
+    /// built from the bundled VideoCAML template). The folder is consumed by the caller.
+    func importGeneratedWallpaper(_ directory: URL, name: String, id: UUID = UUID()) throws -> [WallpaperPack] {
+        if fm.fileExists(atPath: manifest(id).path) { _ = try loadPack(id); return try listWallpapers() }
+        return try importDescriptors(in: directory, name: name, id: id)
+    }
+    private func importDescriptors(in temporary: URL, name: String, id: UUID) throws -> [WallpaperPack] {
         let descriptors = try WallpaperPackages.descriptors(in: temporary)
         let destination = folder(id)
         try fm.createDirectory(at: wallpapers, withIntermediateDirectories: true)
@@ -89,7 +98,7 @@ actor CustomizationStore {
         var saved = false
         defer { if !saved { try? fm.removeItem(at: staging) } }
         try fm.createDirectory(at: staging, withIntermediateDirectories: false)
-        var pack = WallpaperPack(id: id, name: source.deletingPathExtension().lastPathComponent, descriptors: [])
+        var pack = WallpaperPack(id: id, name: name, descriptors: [])
         for (sourceFolder, provider) in descriptors {
             let name = UUID().uuidString
             let target = staging.appendingPathComponent(name)
@@ -239,6 +248,97 @@ actor CustomizationStore {
         if fm.fileExists(atPath: recordsURL.path) { try fm.removeItem(at: recordsURL) }
         if hasImport { try fm.removeItem(at: directory) }
         log("Wallpapers: removed only this pack's tracked additions.")
+        return try listWallpapers()
+    }
+
+    /// Installation records left after Delete: the pack folder is gone, but
+    /// WallpaperInstallations/ still tracks descriptors on the device.
+    /// Packs still in Wallpapers/ are excluded so `removeWallpaper` is not used
+    /// on them (that API also deletes the library copy).
+    private func deletedPackInstallationIDs() throws -> (owned: [UUID], foreign: Bool) {
+        let directory = try CustomizationFiles.checked("WallpaperInstallations", in: storage, missing: true)
+        guard fm.fileExists(atPath: directory.path) else { return ([], false) }
+        let values = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard values.isDirectory == true, values.isSymbolicLink != true else {
+            throw CustomizationFailure("The archive contains unsafe paths or links.")
+        }
+        var owned: [UUID] = []
+        var foreign = false
+        for url in try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]) {
+            guard url.pathExtension.lowercased() == "plist",
+                  let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent) else { continue }
+            let packFolder = try CustomizationFiles.checked("Wallpapers/\(id.uuidString)", in: storage, missing: true)
+            if fm.fileExists(atPath: packFolder.path) { continue }
+            let snapshots = try installationRecords(id).map { try decodePack($0, id: id) }
+            if snapshots.contains(where: { !$0.installations.isEmpty && $0.installedDevice == device }) {
+                owned.append(id)
+            } else if snapshots.contains(where: { !$0.installations.isEmpty && $0.installedDevice != nil && $0.installedDevice != device }) {
+                foreign = true
+            }
+        }
+        return (owned.sorted { $0.uuidString < $1.uuidString }, foreign)
+    }
+
+    func hasRestorableWallpapers() throws -> Bool {
+        if try listWallpapers().contains(where: { $0.isApplied && ($0.installedDevice == nil || $0.installedDevice == device) }) {
+            return true
+        }
+        if try !deletedPackInstallationIDs().owned.isEmpty { return true }
+        return posterBoardDefaultsJournalHasOriginals()
+    }
+
+    private func posterBoardDefaultsTransaction(root: URL) -> CustomizationFileTransaction {
+        CustomizationFileTransaction(root: root, storage: storage.appendingPathComponent("PosterBoardDefaults"), device: device)
+    }
+
+    private func posterBoardDefaultsJournalHasOriginals() -> Bool {
+        let url = storage.appendingPathComponent("PosterBoardDefaults/Originals.plist")
+        guard fm.fileExists(atPath: url.path),
+              let journal = try? PropertyListDecoder().decode(CustomizationJournal.self, from: Data(contentsOf: url)),
+              journal.device == device else { return false }
+        return !journal.originals.isEmpty
+    }
+
+    /// Removes GestaltX-installed wallpaper descriptors and restores the first PosterBoard defaults backup.
+    func restoreOriginalWallpapers() throws -> [WallpaperPack] {
+        let packs = try listWallpapers()
+        let owned = packs.filter { $0.isApplied && ($0.installedDevice == nil || $0.installedDevice == device) }
+        let leftover = try deletedPackInstallationIDs()
+        let foreign = leftover.foreign || packs.contains { $0.isApplied && $0.installedDevice != nil && $0.installedDevice != device }
+        guard !owned.isEmpty || !leftover.owned.isEmpty || posterBoardDefaultsJournalHasOriginals() else {
+            if foreign { throw CustomizationFailure("These wallpapers were applied on a different device. They were not removed.") }
+            throw CustomizationFailure("There is nothing to restore.")
+        }
+        // Deleted packs: reuse removeWallpaper, which reads WallpaperInstallations/ and
+        // uninstalls those descriptors without requiring the library folder to still exist.
+        for id in leftover.owned {
+            _ = try removeWallpaper(id)
+        }
+        try access("com.apple.PosterBoard") { root in
+            for pack in owned {
+                for entry in pack.installations {
+                    let url = try installationURL(entry.relative, root: root)
+                    if fm.fileExists(atPath: url.path), try CustomizationFiles.tree(url) != entry.files, entry.committed {
+                        throw CustomizationFailure("This wallpaper was changed outside GestaltX. It was not removed.")
+                    }
+                }
+            }
+            for pack in owned {
+                for entry in pack.installations { try removeInstallation(entry, root: root) }
+            }
+            let writer = posterBoardDefaultsTransaction(root: root)
+            if writer.hasOriginals { try writer.restore() }
+            // Drop the first-backup journal so Restore Original disables until the next apply.
+            let journalURL = storage.appendingPathComponent("PosterBoardDefaults/Originals.plist")
+            if fm.fileExists(atPath: journalURL.path) { try fm.removeItem(at: journalURL) }
+        }
+        for pack in owned {
+            var updated = pack
+            updated.installations = []
+            updated.installedDevice = nil
+            try savePack(updated)
+        }
+        log("Wallpapers: restored original PosterBoard files and removed GestaltX-added descriptors.")
         return try listWallpapers()
     }
 }

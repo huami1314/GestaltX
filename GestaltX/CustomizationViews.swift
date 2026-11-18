@@ -29,8 +29,20 @@ final class CustomizationModel: ObservableObject {
     private func loadPreviews() async {
         for pack in packs where previews[pack.id] == nil { previews[pack.id] = try? await store.wallpaperPreview(pack.id) }
     }
+    @Published private(set) var canRestoreOriginal = false
     func loadWallpapers() async {
-        await run { packs = try await store.listWallpapers(); await loadPreviews() }
+        await run {
+            packs = try await store.listWallpapers()
+            await loadPreviews()
+            canRestoreOriginal = try await store.hasRestorableWallpapers()
+        }
+    }
+    func restoreOriginalWallpapers() async {
+        await run {
+            packs = try await store.restoreOriginalWallpapers()
+            canRestoreOriginal = try await store.hasRestorableWallpapers()
+            message = L("Original PosterBoard files were restored. Force-close PosterBoard afterward.")
+        }
     }
     @discardableResult
     func importWallpaper(_ url: URL, id: UUID = UUID()) async -> Bool {
@@ -41,10 +53,128 @@ final class CustomizationModel: ObservableObject {
         catch { message = error.localizedDescription; return false }
     }
     func applyWallpaper(_ pack: WallpaperPack) async {
-        await run {
+        guard !busy else { return }
+        busy = true; defer { busy = false }
+        do {
             packs = try await store.applyWallpaper(pack.id)
+            canRestoreOriginal = try await store.hasRestorableWallpapers()
             message = L("Wallpaper added. Open the wallpaper gallery to select it. If it does not appear, restart PosterBoard or respring.")
+        } catch is CancellationError {
+        } catch {
+            message = error.localizedDescription + "\n\n" + L("If this keeps failing, tap Clear Collections and try again.")
         }
+    }
+
+    // MARK: Clear Collections (Pocket Poster "Reset Collections")
+    var systemLanguage: String? { PosterCollections.currentLanguage() }
+    func clearCollections() {
+        guard let language = systemLanguage else {
+            message = L("The system language could not be read. Change the language in Settings and back to refresh collections manually.")
+            return
+        }
+        if PosterCollections.reset(language: language) {
+            message = L("Collections cleared. PosterBoard will refresh automatically. Apply your wallpaper again.")
+        } else {
+            message = String(format: L("The language API could not be called.\nSystem language code: %@. In Settings, go to General → Language & Region, switch to another language, then switch back and wait a few minutes."), language)
+        }
+    }
+
+    // MARK: Video wallpapers (Pocket Poster "Videos")
+    @Published var videos: [WallpaperVideo] = []
+    /// While the Videos screen is on top it owns the message alert.
+    @Published var videosScreenOpen = false
+    @Published private(set) var videoProgress: String?
+    func addVideo(_ url: URL, ignoreLimit: Bool) async -> String? {
+        guard videos.count < WallpaperVideos.maximumVideos else {
+            try? FileManager.default.removeItem(at: url)
+            return String(format: L("You can add up to %d videos."), WallpaperVideos.maximumVideos)
+        }
+        let limit = ignoreLimit ? WallpaperVideos.extendedDuration : WallpaperVideos.maximumDuration
+        let duration: Double
+        do {
+            duration = try await WallpaperVideos.duration(of: url)
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            CustomizationArchive.log("Videos: could not read duration for \(url.lastPathComponent) (\(error.localizedDescription))")
+            return L("The video could not be read.")
+        }
+        // Non-finite values (indefinite → infinity, invalid → NaN) must not be treated as "too long".
+        guard duration.isFinite, duration > 0 else {
+            try? FileManager.default.removeItem(at: url)
+            CustomizationArchive.log("Videos: unreadable duration for \(url.lastPathComponent) (raw \(duration)s)")
+            return L("The video could not be read.")
+        }
+        guard duration <= limit + 0.05 else {
+            try? FileManager.default.removeItem(at: url)
+            CustomizationArchive.log("Videos: rejected too-long clip \(url.lastPathComponent) (\(duration)s, limit \(limit)s)")
+            return String(format: L("The video you imported is too long! Your video must be %d seconds or less."), Int(limit))
+        }
+        videos.append(WallpaperVideo(url: url, duration: duration))
+        return nil
+    }
+    func removeVideos(at offsets: IndexSet) {
+        let urls = offsets.compactMap { videos.indices.contains($0) ? videos[$0].url : nil }
+        // Drop the rows first so LoopingVideoPlayer is dismantled before the files go away.
+        videos.remove(atOffsets: offsets)
+        DispatchQueue.main.async {
+            for url in urls { try? FileManager.default.removeItem(at: url) }
+        }
+    }
+    /// Generates one CollectionsPoster descriptor per video, imports them as a single
+    /// wallpaper pack, and optionally applies it through the normal pipeline.
+    func createVideoWallpaper(apply: Bool) async {
+        guard !busy, !videos.isEmpty else { return }
+        busy = true; defer { busy = false; videoProgress = nil }
+        let selected = videos
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("GX-VideoWallpaper-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var imported = false
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            for (index, video) in selected.enumerated() {
+                let label = String(format: L("Generating video %d of %d…"), index + 1, selected.count)
+                videoProgress = label
+                try await Task.detached(priority: .userInitiated) {
+                    try await WallpaperVideos.makeDescriptor(from: video.url, autoReverses: video.autoReverses, in: directory) { done, total in
+                        Task { @MainActor [weak self] in
+                            self?.videoProgress = label + " " + String(format: L("Frame %d of ~%d"), done, total)
+                        }
+                    }
+                }.value
+            }
+            videoProgress = L("Saving wallpaper pack…")
+            let formatter = DateFormatter(); formatter.dateStyle = .medium; formatter.timeStyle = .short
+            let id = UUID()
+            packs = try await store.importGeneratedWallpaper(directory, name: String(format: L("Video Wallpaper %@"), formatter.string(from: Date())), id: id)
+            imported = true
+            await loadPreviews()
+            if apply {
+                videoProgress = L("Applying…")
+                packs = try await store.applyWallpaper(id)
+                canRestoreOriginal = try await store.hasRestorableWallpapers()
+                message = L("Video wallpaper added. Open the wallpaper gallery to select it. If it does not appear, tap Clear Collections, then restart PosterBoard or respring.")
+            } else {
+                message = L("Video wallpaper saved to Wallpaper Settings. Tap Apply on it when you're ready.")
+            }
+            await discardQueuedVideos(selected)
+        } catch is CancellationError {
+            if imported { await discardQueuedVideos(selected) }
+        } catch {
+            if imported && apply {
+                message = error.localizedDescription + "\n\n" + L("The pack was saved in Wallpaper Settings. Tap Apply on it after you Clear Collections, rather than creating it again.")
+            } else {
+                message = error.localizedDescription + (apply ? "\n\n" + L("If this keeps failing, tap Clear Collections and try again.") : "")
+            }
+            if imported { await discardQueuedVideos(selected) }
+        }
+    }
+    /// Drops already-imported clips so a retry cannot create a second pack.
+    /// Tears down LoopingVideoPlayer / AVPlayerLooper before deleting the files they are still reading.
+    private func discardQueuedVideos(_ selected: [WallpaperVideo]) async {
+        videos.removeAll { item in selected.contains { $0.id == item.id } }
+        await Task.yield()
+        try? await Task.sleep(nanoseconds: 80_000_000)
+        for video in selected { try? FileManager.default.removeItem(at: video.url) }
     }
     func removeWallpaper(_ pack: WallpaperPack) async {
         await run { packs = try await store.removeWallpaper(pack.id); previews.removeValue(forKey: pack.id) }
@@ -114,12 +244,21 @@ struct WallpapersView: View {
     @State private var showsImport = false
     @State private var pendingApply: WallpaperPack?
     @State private var pendingDelete: WallpaperPack?
+    @State private var pendingClear = false
+    @State private var pendingRestore = false
     @State private var presentationOwner = UUID()
     var body: some View {
         List {
             Section {
                 Button { showsImport = true } label: { Label(L("Import Wallpaper"), systemImage: "square.and.arrow.down") }
             } footer: { Text(L("Import a .tendies or .zip wallpaper pack. You can also share it to GestaltX.")) }
+            Section {
+                NavigationLink { WallpaperVideosView(model: model) } label: {
+                    LabeledContent {
+                        if !model.videos.isEmpty { Text(String(model.videos.count)) }
+                    } label: { Label(L("Videos"), systemImage: "video") }
+                }
+            } footer: { Text(String(format: L("Turn up to %d short videos into a live wallpaper pack."), WallpaperVideos.maximumVideos)) }
             if model.packs.isEmpty {
                 Section { ContentUnavailableView(L("No Wallpapers"), systemImage: "photo.on.rectangle.angled") }
             } else {
@@ -144,6 +283,11 @@ struct WallpapersView: View {
             }
             Section {
                 Button { model.open("com.apple.PosterBoard") } label: { Label(L("Open Wallpaper Gallery"), systemImage: "photo.on.rectangle") }
+                Button(role: .destructive) { pendingClear = true } label: { Label(L("Clear Collections"), systemImage: "arrow.clockwise.circle") }
+                Button { pendingRestore = true } label: { Label(L("Restore Original"), systemImage: "arrow.uturn.backward") }
+                    .disabled(!model.canRestoreOriginal)
+            } footer: {
+                Text(L("Clear Collections is Pocket Poster's Reset Collections: it re-applies your current system language so PosterBoard rebuilds its wallpaper collections. Use it when Apply fails because a file already exists, or new wallpapers don't show up. Restore Original removes only wallpapers GestaltX added and restores the first PosterBoard defaults backup."))
             }
         }
         .navigationTitle(L("Wallpaper Settings"))
@@ -151,7 +295,7 @@ struct WallpapersView: View {
         .disabled(model.busy)
         .toolbar { ToolbarItem(placement: .topBarTrailing) { if model.busy { ProgressView() } } }
         .task { await model.loadWallpapers() }
-        .onChange(of: showsImport || pendingApply != nil || pendingDelete != nil || model.message != nil, initial: true) { _, presenting in
+        .onChange(of: showsImport || pendingApply != nil || pendingDelete != nil || pendingClear || pendingRestore || model.message != nil, initial: true) { _, presenting in
             model.setPresenting(presenting, owner: presentationOwner)
         }
         .onDisappear { if !showsImport { model.setPresenting(false, owner: presentationOwner) } }
@@ -172,7 +316,19 @@ struct WallpapersView: View {
             Button(L("Cancel"), role: .cancel) { pendingDelete = nil }
             Button(L("Delete"), role: .destructive) { if let pack = pendingDelete { Task { await model.deleteImportedWallpaper(pack) } }; pendingDelete = nil }
         } message: { Text(L("This only deletes the imported pack from GestaltX. Applied wallpapers will be kept.")) }
-        .alert(L("GestaltX"), isPresented: Binding(get: { model.message != nil }, set: { if !$0 { model.message = nil } })) {
+        .alert(L("Clear Collections?"), isPresented: $pendingClear) {
+            Button(L("Cancel"), role: .cancel) {}
+            Button(L("Clear Collections"), role: .destructive) { model.clearCollections() }
+        } message: {
+            Text(String(format: L("GestaltX re-applies your current language (%@) so PosterBoard refreshes its collections. Existing wallpapers are kept; the screen may briefly refresh."), model.systemLanguage ?? "?"))
+        }
+        .alert(L("Restore Original"), isPresented: $pendingRestore) {
+            Button(L("Cancel"), role: .cancel) {}
+            Button(L("Restore"), role: .destructive) { Task { await model.restoreOriginalWallpapers() } }
+        } message: {
+            Text(L("Restore only wallpaper descriptors GestaltX added, and the first PosterBoard defaults backup. Force-close PosterBoard afterward."))
+        }
+        .alert(L("GestaltX"), isPresented: Binding(get: { model.message != nil && !model.videosScreenOpen }, set: { if !$0 { model.message = nil } })) {
             Button(L("OK"), role: .cancel) { model.message = nil }
         } message: { Text(model.message ?? "") }
     }

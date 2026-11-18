@@ -68,6 +68,9 @@
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
 			);
+			explicitFolders = (
+				Resources/VideoCAML,
+			);
 			path = GestaltX;
 			sourceTree = "<group>";
 		};

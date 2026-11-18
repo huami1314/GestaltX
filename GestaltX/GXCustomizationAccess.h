@@ -10,6 +10,7 @@ NS_ASSUME_NONNULL_BEGIN
 + (NSDictionary<NSString *, id> *)launchApplicationInventory:(BOOL)discover;
 + (NSDictionary<NSString *, id> *)verifyLaunchApplication:(NSDictionary<NSString *, id> *)metadata;
 + (nullable NSString *)applicationContainerForIdentifier:(NSString *)identifier hint:(nullable NSString *)hint NS_SWIFT_NAME(applicationContainer(for:hint:));
++ (nullable NSString *)resolveDataContainerForIdentifier:(NSString *)identifier NS_SWIFT_NAME(resolveDataContainer(for:));
 + (NSDictionary<NSString *,NSString *> *)applicationGroupContainersForIdentifier:(NSString *)identifier NS_SWIFT_NAME(applicationGroupContainers(for:));
 @end
 NS_ASSUME_NONNULL_END

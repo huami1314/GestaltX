@@ -384,6 +384,9 @@ struct ContentView: View {
                 NavigationLink { AppSoundApplicationsView(customizations: customizations) } label: {
                     Label(L("App Audio Library"), systemImage: "bell.badge")
                 }.disabled(model.isBusy)
+                NavigationLink { DialerThemerView() } label: {
+                    Label(L("Dialer Themer"), systemImage: "circle.grid.3x3")
+                }.disabled(model.isBusy)
             }
             Section(L("Actions")) {
                 if model.snapshot?.source == .local && model.snapshot?.ownershipVerified == true {

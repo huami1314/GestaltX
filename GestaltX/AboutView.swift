@@ -82,6 +82,7 @@ struct CreditsView: View {
                 licensedCredit("ZIPFoundation", author: "Thomas Zoechling", license: "MIT", file: "ZIPFoundation-MIT", url: "https://github.com/weichsel/ZIPFoundation")
                 licensedCredit("AirCard-iOS", author: "Johnny Franks", license: "MIT", file: "AirCard-MIT", url: "https://github.com/Mak5er/AirCard-iOS")
                 licensedCredit("idevice", author: "Jackson Coxson", license: "MIT", file: "idevice-MIT", url: "https://github.com/jkcoxson/idevice")
+                licensedCredit("Pocket Poster", author: "leminlimez", license: "GPL v3", file: "Pocket-Poster-GPL-3.0", url: "https://github.com/leminlimez/Pocket-Poster")
             }
         }
         .navigationTitle(L("Credits & Licenses"))

@@ -35,3 +35,16 @@ GitHub mark: Primer Octicons (GitHub), MIT license.
 Source: https://raw.githubusercontent.com/primer/octicons/main/icons/mark-github-16.svg
 Full license: Primer-Octicons-MIT.txt in the application bundle.
 GitHub names and marks remain GitHub trademarks.
+
+
+4a. Dialer Themer
+Erosion Dialer Themer: https://github.com/jailbreakdotparty/Erosion
+lunginspector / jailbreak.party. GNU GPL v3; full text: GestaltX/Licenses/Erosion-GPL-3.0.txt.
+Ported KeypadManager / KeypadView into GestaltX, using GestaltX's resolveDataContainer, acquirePath / worse_query, and ZIPFoundation. No Erosion IPA binary was copied.
+
+
+4b. Wallpaper Clear Collections + Videos
+Pocket Poster: https://github.com/leminlimez/Pocket-Poster (commit fb07aa4)
+leminlimez and contributors. GNU GPL v3; full text: GestaltX/Licenses/Pocket-Poster-GPL-3.0.txt.
+Ported: "Reset Collections" (shown in GestaltX as Clear Collections; re-applies the system language via IPSettingsUtilities setLanguage:), the Videos feature (VideoHandler CAML frame generation, PlayerView / LoopingPlayerUIView preview) and the bundled Resources/VideoCAML descriptor template (GestaltX/Resources/VideoCAML).
+GestaltX changes: async AVFoundation loading, orientation via CGImagePropertyOrientation, 30 fps / 2796 px frame caps, and generated descriptors feed GestaltX's existing wallpaper import/apply pipeline (worse_query into com.apple.PosterBoard) instead of Pocket Poster's app-hash symlink path.

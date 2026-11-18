@@ -506,12 +506,82 @@ static void GXDiscoverLaunchPaths(void) {
     }
 }
 + (BOOL)openApplication:(NSString *)identifier {
-    if (![GXAllowedApplications() containsObject:identifier]) return NO;
+    // PosterBoard remains the wallpaper target; Phone and other launch apps are
+    // also allowed so Dialer Themer / App Audio can jump back to the edited app.
+    if (![GXAllowedApplications() containsObject:identifier] && !GXLaunchIdentifier(identifier)) return NO;
     dlopen("/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices",RTLD_NOW|RTLD_LOCAL);
     Class workspace = NSClassFromString(@"LSApplicationWorkspace");
     if (![workspace respondsToSelector:@selector(defaultWorkspace)]) return NO;
     id shared = [workspace defaultWorkspace];
     return [shared respondsToSelector:@selector(openApplicationWithBundleID:)] &&
            [shared openApplicationWithBundleID:identifier];
+}
+
+// General-purpose data-container resolver used by Dialer Themer (Phone) and any
+// future feature that needs a non-PosterBoard container. Reuses the same
+// fsgetpath + identity xattr scan as containerForIdentifier:, but accepts any
+// launch identifier and caches under GestaltX.launch.container.* so
+// applicationContainer(for:hint:) can reuse the result.
++ (NSString *)resolveDataContainerForIdentifier:(NSString *)identifier {
+    if (!GXLaunchIdentifier(identifier)) return nil;
+    if ([identifier isEqualToString:NSBundle.mainBundle.bundleIdentifier]) return NSHomeDirectory();
+    // Prefer an already-verified launch cache / inventory hint.
+    NSString *existing = [self applicationContainerForIdentifier:identifier hint:nil];
+    if (existing) return existing;
+    NSDictionary *inventory = [self launchApplicationInventory:YES];
+    NSArray *apps = [inventory[@"applications"] isKindOfClass:NSArray.class] ? inventory[@"applications"] : @[];
+    for (id item in apps) {
+        if (![item isKindOfClass:NSDictionary.class]) continue;
+        if (![item[@"identifier"] isEqualToString:identifier]) continue;
+        NSString *hint = [item[@"container"] isKindOfClass:NSString.class] ? item[@"container"] : nil;
+        NSString *verified = [self applicationContainerForIdentifier:identifier hint:hint];
+        if (verified) return verified;
+    }
+    @synchronized (self) {
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        NSString *key = [@"GestaltX.launch.container." stringByAppendingString:identifier];
+        NSString *cached = [defaults stringForKey:key];
+        if (GXApplicationPath(cached)) {
+            int64_t h = [self acquirePath:cached];
+            NSString *actual = GXContainerIdentity(cached);
+            if (h >= 0) worse_query_release(h);
+            if ([actual isEqualToString:identifier]) return cached;
+            [defaults removeObjectForKey:key];
+        }
+        struct statfs volume;
+        if (statfs("/private/var/mobile/Containers/Data/Application", &volume)) {
+            GXAccessLog(@"resolveDataContainer[%@]: statfs failed errno=%d (%s)", identifier, errno, strerror(errno));
+            return nil;
+        }
+        NSString *probe = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+        int fd = open(probe.fileSystemRepresentation, O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW|O_CLOEXEC, 0600);
+        if (fd < 0) return nil;
+        struct stat own; struct statfs ownVolume;
+        BOOL valid = fstat(fd, &own) == 0 && fstatfs(fd, &ownVolume) == 0 &&
+                     memcmp(&volume.f_fsid, &ownVolume.f_fsid, sizeof(fsid_t)) == 0;
+        close(fd); unlink(probe.fileSystemRepresentation);
+        if (!valid || (uint64_t)own.st_ino > UINT64_MAX - 100000) return nil;
+        uint64_t upper = (uint64_t)own.st_ino + 100000;
+        NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:45];
+        char buffer[4096];
+        GXAccessLog(@"resolveDataContainer[%@]: fsgetpath scan up to ino=%llu", identifier, (unsigned long long)upper);
+        for (uint64_t ino = 1; ino <= upper; ino++) {
+            if (!(ino % 4096) && deadline.timeIntervalSinceNow < 0) break;
+            @autoreleasepool {
+                if (fsgetpath(buffer, sizeof(buffer), &volume.f_fsid, ino) <= 0) continue;
+                NSString *path = [NSString stringWithUTF8String:buffer];
+                if (!GXApplicationPath(path)) continue;
+                int64_t h = [self acquirePath:path];
+                NSString *actual = GXContainerIdentity(path);
+                if (h >= 0) worse_query_release(h);
+                if (![actual isEqualToString:identifier]) continue;
+                [defaults setObject:path forKey:key];
+                GXAccessLog(@"resolveDataContainer[%@]: found %@", identifier, path);
+                return path;
+            }
+        }
+        GXAccessLog(@"resolveDataContainer[%@]: scan finished without a match", identifier);
+        return nil;
+    }
 }
 @end
